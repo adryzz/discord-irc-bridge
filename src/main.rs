@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use irc::proto::Command;
 use log::error;
 use log::info;
@@ -13,6 +11,8 @@ use serenity::model::prelude::ChannelId;
 use serenity::model::prelude::ChannelType;
 use serenity::model::prelude::Ready;
 use serenity::{futures::StreamExt, http::Http, model::webhook::Webhook};
+use std::collections::HashMap;
+use std::sync::Arc;
 type IrcClient = irc::client::Client;
 use anyhow::Result;
 use serenity::prelude::*;
@@ -68,23 +68,30 @@ async fn listen_irc(http: Arc<Http>, guild_id: u64) -> Result<()> {
             Command::PRIVMSG(channel, text) => {
                 let hook = get_correct_webhook(channel, &bridge_webhooks).await?;
                 if let Some(h) = hook {
-                    h.execute(&http, false, |m| m.username(message.source_nickname()
-                    .unwrap_or("null"))
-                    .content(text)
-                    .avatar_url(""))
+                    let name = message.source_nickname().unwrap_or("null");
+                    h.execute(&http, false, |m| {
+                        m.username(name)
+                            .content(text)
+                            .avatar_url(format!("https://singlecolorimage.com/get/{:06x}/1x1", get_color_from_name(name)))
+                    })
                     .await?;
                 }
             }
             Command::TOPIC(channel, text) => {
                 if let Some(chan) = get_correct_channel(channel, &bridged_channels).await? {
-                    chan.edit(&http, |f| f.topic(text.as_ref().map_or("", |x| x.as_str()))).await?;
+                    chan.edit(&http, |f| f.topic(text.as_ref().map_or("", |x| x.as_str())))
+                        .await?;
                 }
-            },
+            }
             _ => (),
         }
     }
 
     Ok(())
+}
+
+fn get_color_from_name(name: &str) -> u32 {
+    crc32fast::hash(name.as_bytes()) >> 8
 }
 
 async fn get_correct_webhook<'a>(
