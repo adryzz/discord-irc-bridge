@@ -1,27 +1,30 @@
 use irc::proto::Command;
-use log::error;
-use log::info;
-use log::trace;
-use log::Level;
+
+use poise::serenity_prelude as serenity;
+use serenity::Interaction;
+use serenity::Ready;
+use serenity::UserId;
 use serde::Deserialize;
-use serenity::async_trait;
-use serenity::framework::StandardFramework;
 use serenity::model::id::GuildId;
 use serenity::model::prelude::ChannelId;
 use serenity::model::prelude::ChannelType;
-use serenity::model::prelude::Ready;
 use serenity::{futures::StreamExt, http::Http, model::webhook::Webhook};
+use tokio::sync::RwLock;
+use tokio::sync::broadcast;
+use tracing::debug;
+use tracing::error;
+use tracing::info;
 use std::collections::HashMap;
 use std::sync::Arc;
 type IrcClient = irc::client::Client;
 use anyhow::Result;
-use serenity::prelude::*;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+type Context<'a> = poise::Context<'a, Data, anyhow::Error>;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().init();
+    console_subscriber::init();
     info!("Starting up Discord <-> IRC bridge...");
 
     if let Err(a) = run().await {
@@ -33,25 +36,38 @@ async fn main() {
 async fn run() -> Result<()> {
     let config = try_read_config("config.toml").await?;
 
-    let intents = GatewayIntents::GUILD_WEBHOOKS;
+    let intents = serenity::GatewayIntents::GUILD_WEBHOOKS;
 
-    let framework = StandardFramework::new();
+    let (tx, _rx) = broadcast::channel(64);
 
-    let handler = Handler {
-        config: config.clone(),
+    let mut handler = Handler {
+        options: poise::FrameworkOptions {
+            commands: vec![write()],
+            ..Default::default()
+        },
+        data: Data {
+            config: config.clone(),
+            tx,
+        },
+        shard_manager: std::sync::Mutex::new(None),
+        bot_id: RwLock::new(None)
     };
 
-    let mut discord = Client::builder(&config.token, intents)
-        .framework(framework)
-        .event_handler(handler)
+    poise::set_qualified_names(&mut handler.options.commands);
+
+    let handler = std::sync::Arc::new(handler);
+
+    let mut client = serenity::Client::builder(config.token, intents)
+        .event_handler_arc(handler.clone())
         .await?;
 
-    discord.start().await?;
+    *handler.shard_manager.lock().unwrap() = Some(client.shard_manager.clone());
+    client.start().await?;
 
     Ok(())
 }
 
-async fn listen_irc(http: Arc<Http>, guild_id: u64) -> Result<()> {
+async fn listen_irc(http: Arc<Http>, guild_id: u64, mut rx: broadcast::Receiver<CMessage>) -> Result<()> {
     let guild = GuildId(guild_id);
 
     let bridged_channels = get_bridged_channels(&http, &guild).await?;
@@ -62,32 +78,48 @@ async fn listen_irc(http: Arc<Http>, guild_id: u64) -> Result<()> {
     client.identify()?;
 
     let mut stream = client.stream()?;
+    let sender = client.sender();
 
-    while let Some(message) = stream.next().await.transpose()? {
-        match &message.command {
-            Command::PRIVMSG(channel, text) => {
-                let hook = get_correct_webhook(channel, &bridge_webhooks).await?;
-                if let Some(h) = hook {
-                    let name = message.source_nickname().unwrap_or("null");
-                    h.execute(&http, false, |m| {
-                        m.username(name)
-                            .content(text)
-                            .avatar_url(format!("https://singlecolorimage.com/get/{:06x}/1x1", get_color_from_name(name)))
-                    })
-                    .await?;
+    loop {
+        tokio::select! {
+            s = stream.next() => {
+                if let Some(message) = s.transpose()? {
+                    match &message.command {
+                        Command::PRIVMSG(channel, text) => {
+                            let hook = get_correct_webhook(&channel, &bridge_webhooks).await?;
+                            if let Some(h) = hook {
+                                let name = message.source_nickname().unwrap_or("null");
+                                h.execute(&http, false, |m| {
+                                    m.username(name)
+                                        .content(text)
+                                        .avatar_url(format!("https://singlecolorimage.com/get/{:06x}/1x1", get_color_from_name(name)))
+                                })
+                                .await?;
+                            debug!("message received in {}: {}", channel, text);
+                            }
+                        }
+                        Command::TOPIC(channel, text) => {
+                            if let Some(chan) = get_correct_channel(&channel, &bridged_channels).await? {
+                                chan.edit(&http, |f| f.topic(text.as_ref().map_or("", |x| x.as_str())))
+                                    .await?;
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+
+            }
+    
+            Ok(msg) = rx.recv() => {
+                if let Some(c) = bridged_channels.get(&msg.channel) {
+                    debug!("sending \"{}\" in #{}", &msg.message, &c);
+                    sender.send_privmsg(format!("#{}", &c), &msg.message)?;
+                } else {
+                    // channel not bridged
                 }
             }
-            Command::TOPIC(channel, text) => {
-                if let Some(chan) = get_correct_channel(channel, &bridged_channels).await? {
-                    chan.edit(&http, |f| f.topic(text.as_ref().map_or("", |x| x.as_str())))
-                        .await?;
-                }
-            }
-            _ => (),
         }
     }
-
-    Ok(())
 }
 
 fn get_color_from_name(name: &str) -> u32 {
@@ -175,16 +207,70 @@ async fn get_or_create_webhooks(
     Ok(list)
 }
 
-struct Handler {
-    config: Config,
+#[poise::command(slash_command)]
+async fn write(
+    ctx: Context<'_>,
+    #[description = "Message"] msg: String
+) -> Result<(), anyhow::Error> {
+
+    ctx.say(&msg).await?;
+    ctx.data().tx.send(CMessage { channel: ctx.channel_id(), message: msg })?;
+
+    Ok(())
 }
 
-#[async_trait]
-impl EventHandler for Handler {
-    async fn ready(&self, ctx: Context, ready: Ready) {
+struct Handler {
+    options: poise::FrameworkOptions<Data, anyhow::Error>,
+    data: Data,
+    shard_manager: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Mutex<serenity::ShardManager>>>>,
+    bot_id: RwLock<Option<UserId>>,
+}
+
+struct Data {
+    config: Config,
+    tx: broadcast::Sender<CMessage>,
+}
+
+#[derive(Debug, Clone)]
+struct CMessage {
+    channel: serenity::ChannelId,
+    message: String
+}
+
+#[serenity::async_trait]
+impl serenity::EventHandler for Handler {
+    async fn ready(&self, ctx: serenity::Context, ready: Ready) {
+        let user_id = ctx.http.get_current_user().await.unwrap().id;
+        let _ = self.bot_id.write().await.insert(user_id);
         info!("Discord connection ready");
         info!("Starting IRC connection...");
-        tokio::spawn(listen_irc(ctx.http, self.config.guild_id));
+        tokio::spawn(irc(ctx.http.clone(), self.data.config.guild_id, self.data.tx.subscribe()));
+        self.dispatch_poise_event(&ctx, &poise::Event::Ready { data_about_bot: ready }).await;
+
+        poise::builtins::register_in_guild(ctx.http, &self.options.commands, GuildId(self.data.config.guild_id)).await.unwrap();
+    }
+
+    async fn interaction_create(&self, ctx: serenity::Context, interaction: Interaction) {
+        self.dispatch_poise_event(&ctx, &poise::Event::InteractionCreate { interaction }).await;
+    }
+}
+impl Handler {
+    async fn dispatch_poise_event(&self, ctx: &serenity::Context, event: &poise::Event<'_>) {
+        let shard_manager = (*self.shard_manager.lock().unwrap()).clone().unwrap();
+        let framework_data = poise::FrameworkContext {
+            bot_id: self.bot_id.read().await.unwrap_or_else(|| UserId(0)),
+            options: &self.options,
+            user_data: &self.data,
+            shard_manager: &shard_manager,
+        };
+        poise::dispatch_event(framework_data, ctx, event).await;
+    }
+}
+
+async fn irc(http: Arc<Http>, guild_id: u64, rx: broadcast::Receiver<CMessage>) {
+    match listen_irc(http, guild_id, rx).await {
+        Ok(_) => info!("listen_irc exited"),
+        Err(e) => error!("listen_irc error: {}", e)
     }
 }
 
